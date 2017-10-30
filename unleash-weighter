@@ -1,0 +1,261 @@
+#! /usr/bin/env python
+
+#
+# This utility polls unleash in a given environment for information
+# about load balancing between legacy and kubernetes.
+#
+
+import requests
+import logging
+import time
+import socket
+import sys
+import re
+import json
+import os
+from datetime import datetime
+import haproxyadmin
+from haproxyadmin import haproxy
+
+FETCH_MIN_INTERVAL = 10
+UNLEASH_BASE = os.environ.get('UNLEASH_BASE', 'https://unleash.herokuapp.com/api')
+SOCKETDIR = os.environ.get('HAPROXY_STATS_DIR', '/var/run/haproxy/stats')
+APPNAME = "unleash-haproxy-weighter"
+INSTANCE_ID = socket.getfqdn()
+start_time = datetime.utcnow()
+
+class UnleashFeature(object):
+    def __init__(self, name):
+        self.name = name
+        self.last_fetched = 0
+        self._legacy_weight = None
+        self._valid = False
+
+    def fetch(self):
+        if self.last_fetched + FETCH_MIN_INTERVAL > time.time():
+            logging.debug("Ignoring fetch for %s, not long enough time passed", self.name)
+            return
+        url = UNLEASH_BASE + "/features/" + self.name
+        r = requests.get(url, timeout=1)
+        logging.debug("Fetching %s", self.name)
+        self.last_fetched = time.time()
+        if r.status_code != 200:
+            logging.error("Something went wrong while fetching %s: %s", url, r.status_code)
+            self._valid = False
+            self._legacy_weight = None
+            return
+        try:
+            js = r.json()
+
+            if not js['enabled']:
+                self._valid = False
+                return
+
+            if filter(lambda x: x['name'] == 'kubernetesLegacyHost', js['strategies']):
+                w = int(filter(lambda x: x['name'] == 'kubernetesLegacyHost', js['strategies'])[0]['parameters']['legacy-weight'])
+                if w < 0 or w > 100:
+                    self._valid = False
+                    self._legacy_weight = None
+                    return
+                self._legacy_weight = w
+                self._valid = True
+                return
+            elif filter(lambda x: x['name'] == 'gradualRolloutRandom', js['strategies']):
+                w = int(filter(lambda x: x['name'] == 'gradualRolloutRandom', js['strategies'])[0]['parameters']['percentage'])
+                if w < 0 or w > 100:
+                    self._valid = False
+                    self._legacy_weight = None
+                    return
+                self._legacy_weight = w
+                self._valid = True
+                return
+            self._legacy_weight = None
+            self._valid = False
+        except ValueError:
+            logging.exception("Something went wrong while parsing legacy-weight")
+            self._valid = False
+            self._legacy_weight = None
+
+    def send_metrics(self, start, end, legacy_requests, fiaas_requests):
+        url = UNLEASH_BASE + '/client/metrics'
+        payload = {
+            "appName": APPNAME,
+            "instanceId": INSTANCE_ID,
+            "bucket": {
+                "start": start.isoformat() + "Z",
+                "stop": end.isoformat() + "Z",
+                "toggles": {
+                    self.name: {
+                        "yes": legacy_requests,
+                        "no": fiaas_requests,
+                    }
+                }
+            }
+        }
+        logging.debug("sending metrics: %s", json.dumps(payload), )
+        r = requests.post(url, data=json.dumps(payload), timeout=1, headers={"content-type": "application/json"})
+        if r.status_code != 200:
+            r.raise_for_status()
+
+
+    @property
+    def legacy_weight(self):
+        self.fetch()
+        if self.valid:
+            return self._legacy_weight
+        return None
+
+    @property
+    def valid(self):
+        self.fetch()
+        return self._valid
+
+    def __str__(self):
+        return "name=%s last_fetched=%s legacy_weight=%s valid=%s" % (self.name, self.last_fetched, self._legacy_weight, self._valid)
+
+
+class App(object):
+    def __init__(self, name, haproxyadmin):
+        self.name = name
+        self._feature = UnleashFeature('kubernetes.loadbalance.legacy.' + name)
+        self.haproxyadmin = haproxyadmin
+        self.metric_timestamp = datetime.utcnow()
+        self.legacy_requests = 0
+        self.fiaas_requests = 0
+
+    def exists(self):
+        return len(self.haproxyadmin.backends(self.name)) > 0
+
+    def _backends(self):
+        return self.haproxyadmin.backends(self.name)
+
+    def _legacy_servers(self, backend):
+        return backend.servers(self.name + '-legacy')
+
+    def _fiaas_servers(self, backend):
+        return backend.servers(self.name + '-fiaas')
+
+    def wanted_legacy_weight(self):
+        if self._feature.valid:
+            return self._feature.legacy_weight
+        raise Exception("Weight for {} is not valid".format(self.name))
+
+    def current_legacy_weight(self):
+        # This makes the assumption that all weights are the same,
+        # which they hopefully are..
+        return int(self._legacy_servers(self._backends()[0])[0].weight)
+
+    def update_weights(self):
+        backends = self._backends()
+        for backend in backends:
+            for server in self._legacy_servers(backend):
+                server.setweight(self.wanted_legacy_weight())
+        for backend in backends:
+            for server in self._fiaas_servers(backend):
+                server.setweight(100 - self.wanted_legacy_weight())
+
+    def valid(self):
+        return self.exists() and self._feature.valid
+
+    def __str__(self):
+        return self.name
+
+    def collect_metrics(self):
+        http_resp_metrics = filter(lambda x: x.startswith("hrsp_"), haproxyadmin.BACKEND_METRICS)
+
+        try:
+            legacy_backend = self.haproxyadmin.backend(self.name + '-legacy')
+            fiaas_backend = self.haproxyadmin.backend(self.name + '-fiaas')
+        except ValueError:
+            return
+        legacy_total = reduce(lambda x,y: x+y, map(lambda x: legacy_backend.metric(x), http_resp_metrics))
+        fiaas_total = reduce(lambda x,y: x+y, map(lambda x: fiaas_backend.metric(x), http_resp_metrics))
+        ts = datetime.utcnow()
+
+        # Handle startup and initialise to current numbers.  This
+        # might lead to losing a few requests, but no way around that,
+        # and better to lose those than add extra from when haproxy
+        # started until now.
+        if self.legacy_requests == 0:
+            self.legacy_requests = legacy_total
+        if self.fiaas_requests == 0:
+            self.fiaas_requests = fiaas_total
+
+        legacy_delta = legacy_total - self.legacy_requests
+        fiaas_delta = fiaas_total - self.fiaas_requests
+
+        logging.info("Sending metrics for %s: legacy_delta=%s  fiaas_delta=%s", self.name, legacy_delta, fiaas_delta)
+        self._feature.send_metrics(self.metric_timestamp, ts, legacy_delta, fiaas_delta)
+
+        self.metric_timestamp = ts
+        self.legacy_requests = legacy_total
+        self.fiaas_requests = fiaas_total
+
+
+def fetch_apps():
+    feature_prefix = 'kubernetes.loadbalance.legacy.'
+    url = UNLEASH_BASE + "/features/"
+    r = requests.get(url, timeout=1)
+    logging.debug("Fetching all apps")
+    if r.status_code != 200:
+        logging.error("Something went wrong while fetching %s: %s", url, r.status_code)
+        return []
+    ret = []
+    try:
+        js = r.json()
+        for feature in js['features']:
+            if not feature['enabled']:
+                continue
+            if not feature['name'].startswith(feature_prefix):
+                continue
+            ret.append(feature['name'][len(feature_prefix):])
+    except ValueError:
+        logging.exception("Something went wrong while parsing legacy-weight")
+    return ret
+
+def unleash_register(url, start_time, interval=10):
+    payload = {
+        "appName": APPNAME,
+        "instanceId": INSTANCE_ID,
+        "strategies": [ "gradualRolloutRandom", "kubernetesLegacyHost" ],
+        "started": start_time.isoformat() + "Z",
+        "interval": interval,
+        }
+    logging.info("registering with data: %s", json.dumps(payload), )
+    r = requests.post(url, data=json.dumps(payload), timeout=1, headers={"content-type": "application/json"})
+    if r.status_code != 200:
+        r.raise_for_status()
+
+
+if __name__ == '__main__':
+    # Fetch all from unleash
+    loglevel = getattr(logging, os.environ.get('LOG_LEVEL', 'INFO'))
+    logging.basicConfig(level=loglevel)
+
+    try:
+        unleash_register(UNLEASH_BASE + "/client/register", start_time)
+    except:
+        logging.exception("Registering to unleash")
+        sys.exit(1)
+    active_apps = []
+    while True:
+        h = haproxy.HAProxy(socket_dir=SOCKETDIR)
+        apps_from_unleash = fetch_apps()
+        if active_apps != apps_from_unleash:
+            active_apps = apps_from_unleash
+            apps = [App(a, h) for a in apps_from_unleash]
+        for i in range(10):
+            for app in apps:
+                app.collect_metrics()
+                logging.debug("Looking at app %s", app)
+                if not app.valid():
+                    logging.error("App config for %s is not valid, skipping", app)
+                    continue
+                try:
+                    current_legacy_weight = app.current_legacy_weight()
+                    if app.wanted_legacy_weight() != current_legacy_weight:
+                        logging.info("Changing legacy weight for %s from %s to %s", app, current_legacy_weight, app.wanted_legacy_weight())
+                        app.update_weights()
+                except:
+                    logging.exception("Configuring app {}".format(app))
+            time.sleep(5)
